@@ -24,7 +24,6 @@ export async function onRequest(context) {
     const decodedUrl = decodeURIComponent(streamUrl);
     const targetUrl = new URL(decodedUrl);
 
-    // রিকোয়েস্ট পাঠানোর সময় মূল সার্ভারের অরিজিন ও রিফারার পাঠানো
     const response = await fetch(decodedUrl, {
       method: 'GET',
       headers: {
@@ -43,6 +42,49 @@ export async function onRequest(context) {
       });
     }
 
+    const contentType = response.headers.get('content-type') || '';
+    
+    // m3u8 প্লেলিস্ট হলে ভেতরের সব ইউআরএল প্রক্সিতে রিরাইট করা
+    if (decodedUrl.includes('.m3u8') || contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('text/plain')) {
+      let manifestText = await response.text();
+      const baseUrl = decodedUrl.substring(0, decodedUrl.lastIndexOf('/') + 1);
+
+      const proxyBase = `${url.origin}${url.pathname}?url=`;
+
+      // ফাইল পাথ রিরাইট করার লজিক
+      const lines = manifestText.split('\n');
+      const rewrittenLines = lines.map(line => {
+        const trimmed = line.trim();
+        if (!trimmed) return line;
+
+        // URI= "..." সমৃদ্ধ লাইন (যেমন Key ফাইল)
+        if (trimmed.includes('URI="')) {
+          return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
+            const absolute = p1.startsWith('http') ? p1 : new URL(p1, baseUrl).href;
+            return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
+          });
+        }
+
+        // সাধারণ সেগমেন্ট ও চাইল্ড প্লেলিস্ট (.ts, .m3u8, .m4s ইত্যাদি)
+        if (!trimmed.startsWith('#')) {
+          const absolute = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).href;
+          return `${proxyBase}${encodeURIComponent(absolute)}`;
+        }
+
+        return line;
+      });
+
+      return new Response(rewrittenLines.join('\n'), {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Cache-Control': 'no-cache'
+        }
+      });
+    }
+
+    // TS বা অন্যান্য মিডিয়া ফাইলের ক্ষেত্রে বাইনারি স্ট্রিম পাঠানো
     const newHeaders = new Headers(response.headers);
     Object.keys(corsHeaders).forEach(key => newHeaders.set(key, corsHeaders[key]));
 
