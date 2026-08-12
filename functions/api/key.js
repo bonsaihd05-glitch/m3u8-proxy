@@ -22,13 +22,17 @@ export async function onRequest(context) {
 
   try {
     const decodedUrl = decodeURIComponent(streamUrl);
+    const targetUrl = new URL(decodedUrl);
 
+    // রিকোয়েস্ট পাঠানোর সময় মূল সার্ভারের অরিজিন ও রিফারার পাঠানো
     const response = await fetch(decodedUrl, {
       method: 'GET',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': '*/*',
-        'Connection': 'keep-alive'
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': targetUrl.origin,
+        'Referer': targetUrl.origin + '/'
       }
     });
 
