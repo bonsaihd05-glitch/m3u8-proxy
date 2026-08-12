@@ -2,10 +2,12 @@ export async function onRequest(context) {
   const { request } = context;
   const url = new URL(request.url);
 
+  // ১. ইউনিভার্সাল CORS হেডার
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': '*',
+    'Access-Control-Expose-Headers': '*',
   };
 
   if (request.method === 'OPTIONS') {
@@ -15,7 +17,7 @@ export async function onRequest(context) {
   const streamUrl = url.searchParams.get('url');
   if (!streamUrl) {
     return new Response(
-      JSON.stringify({ error: 'Missing "url" parameter' }), 
+      JSON.stringify({ error: 'Missing "url" parameter. Usage: /api/key?url=YOUR_STREAM_URL' }), 
       { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -24,51 +26,69 @@ export async function onRequest(context) {
     const decodedUrl = decodeURIComponent(streamUrl);
     const targetUrl = new URL(decodedUrl);
 
-    const response = await fetch(decodedUrl, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': targetUrl.origin,
-        'Referer': targetUrl.origin + '/'
+    // ২. স্মার্ট হেডার তৈরি (স্মার্ট রিকুয়েস্ট স্পুফিং)
+    let requestHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': targetUrl.origin,
+      'Referer': `${targetUrl.origin}/`,
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'cross-site'
+    };
+
+    // কাস্টম হেডার পাঠালে তা রিকুয়েস্টে যুক্ত করবে
+    const customHeadersParam = url.searchParams.get('headers');
+    if (customHeadersParam) {
+      try {
+        const parsedHeaders = JSON.parse(decodeURIComponent(customHeadersParam));
+        Object.assign(requestHeaders, parsedHeaders);
+      } catch (e) {
+        // হেডার পার্স না হলে আগেরটিই থাকবে
       }
+    }
+
+    // ৩. মূল স্ট্রিম সার্ভারে রিকোয়েস্ট পাঠানো
+    const response = await fetch(decodedUrl, {
+      method: request.method,
+      headers: requestHeaders
     });
 
     if (!response.ok) {
-      return new Response(`Failed to load stream: ${response.statusText}`, {
+      return new Response(`Proxy Error: Server responded with status ${response.status} (${response.statusText})`, {
         status: response.status,
         headers: corsHeaders
       });
     }
 
     const contentType = response.headers.get('content-type') || '';
-    
-    // m3u8 প্লেলিস্ট হলে ভেতরের সব ইউআরএল প্রক্সিতে রিরাইট করা
-    if (decodedUrl.includes('.m3u8') || contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('text/plain')) {
+    const isM3U8 = decodedUrl.includes('.m3u8') || contentType.includes('mpegurl') || contentType.includes('apple') || contentType.includes('text/plain');
+
+    // ৪. M3U8 প্লেলিস্ট রিরাইট লজিক (TS/M4S/Key প্রক্সি করা)
+    if (isM3U8) {
       let manifestText = await response.text();
       const baseUrl = decodedUrl.substring(0, decodedUrl.lastIndexOf('/') + 1);
 
+      let passHeaders = customHeadersParam ? `&headers=${encodeURIComponent(customHeadersParam)}` : '';
       const proxyBase = `${url.origin}${url.pathname}?url=`;
 
-      // ফাইল পাথ রিরাইট করার লজিক
       const lines = manifestText.split('\n');
       const rewrittenLines = lines.map(line => {
         const trimmed = line.trim();
         if (!trimmed) return line;
 
-        // URI= "..." সমৃদ্ধ লাইন (যেমন Key ফাইল)
+        // AES-128 Key রিরাইট
         if (trimmed.includes('URI="')) {
           return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
             const absolute = p1.startsWith('http') ? p1 : new URL(p1, baseUrl).href;
-            return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
+            return `URI="${proxyBase}${encodeURIComponent(absolute)}${passHeaders}"`;
           });
         }
 
-        // সাধারণ সেগমেন্ট ও চাইল্ড প্লেলিস্ট (.ts, .m3u8, .m4s ইত্যাদি)
+        // চাইল্ড প্লেলিস্ট ও ভিডিও সেগমেন্ট (.ts, .m4s, .aac ইত্যাদি)
         if (!trimmed.startsWith('#')) {
           const absolute = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).href;
-          return `${proxyBase}${encodeURIComponent(absolute)}`;
+          return `${proxyBase}${encodeURIComponent(absolute)}${passHeaders}`;
         }
 
         return line;
@@ -79,19 +99,19 @@ export async function onRequest(context) {
         headers: {
           ...corsHeaders,
           'Content-Type': 'application/vnd.apple.mpegurl',
-          'Cache-Control': 'no-cache'
+          'Cache-Control': 'no-cache, no-store'
         }
       });
     }
 
-    // TS বা অন্যান্য মিডিয়া ফাইলের ক্ষেত্রে বাইনারি স্ট্রিম পাঠানো
-    const newHeaders = new Headers(response.headers);
-    Object.keys(corsHeaders).forEach(key => newHeaders.set(key, corsHeaders[key]));
+    // ৫. ভিডিও সেগমেন্ট বা বাইনারি রেসপন্স সরাসরি পাস করা
+    const responseHeaders = new Headers(response.headers);
+    Object.keys(corsHeaders).forEach(key => responseHeaders.set(key, corsHeaders[key]));
 
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
-      headers: newHeaders
+      headers: responseHeaders
     });
 
   } catch (error) {
